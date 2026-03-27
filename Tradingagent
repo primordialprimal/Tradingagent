@@ -1,0 +1,364 @@
+"""
+MambaFX Agent v4 — Unified Engine
+Architecture: Gemini | Candle Fix: Confirmed TradeLocker Library
+Instruments: DJIUSD (14375) | NDXUSD (14369)
+Run: py mamba_agent_v4.py
+"""
+
+import time
+import csv
+import os
+import logging
+from datetime import datetime, timezone
+from tradelocker import TLAPI
+
+# Suppress library debug noise
+logging.getLogger("tradelocker").setLevel(logging.WARNING)
+
+# ─────────────────────────────────────────
+#  1. CONFIGURATION
+# ─────────────────────────────────────────
+class Config:
+    EMAIL    = "primordialprimal@proton.me"
+    PASSWORD = "Clarity#1"
+    SERVER   = "CLRTYFX"
+
+    # Confirmed instrument IDs from TradeLocker
+    INSTRUMENTS = {
+        "DJIUSD": 14375,
+        "NDXUSD": 14369,
+    }
+
+    SESSIONS = {
+        "london":   {"start": 3,  "end": 5},
+        "new_york": {"start": 8,  "end": 10},
+    }
+
+    SCAN_MAMBA = 300
+    SCAN_ALEXG = 1800
+
+    RISK = {
+        "max_daily_drawdown_pct": 3.0,
+        "max_risk_per_trade_pct": 1.0,
+        "kill_switch": False,
+    }
+
+# ─────────────────────────────────────────
+#  2. API LAYER
+# ─────────────────────────────────────────
+class TradeLockerAPI:
+    def __init__(self, config):
+        self.config = config
+        self.tl     = None
+
+    def authenticate(self):
+        try:
+            self.tl = TLAPI(
+                environment = "https://demo.tradelocker.com",
+                username    = self.config.EMAIL,
+                password    = self.config.PASSWORD,
+                server      = self.config.SERVER,
+                account_id  = 1941353
+            )
+            return True
+        except Exception as e:
+            print(f"❌ Auth error: {e}")
+            return False
+
+    def load_account(self):
+        # Account is loaded during TLAPI init
+        return self.tl is not None
+
+    def get_candles(self, instrument_name, resolution_mins, count=50):
+        """
+        Fetch candles using confirmed TradeLocker library method.
+        Returns list of dicts with open/high/low/close or None.
+        """
+        inst_id  = self.config.INSTRUMENTS.get(instrument_name)
+        lookback = "1D" if resolution_mins <= 15 else "1W"
+
+        # Resolution as string
+        res = str(resolution_mins)
+
+        try:
+            df = self.tl.get_price_history(
+                inst_id,
+                resolution    = res,
+                start_timestamp = 0,
+                end_timestamp   = 0,
+                lookback_period = lookback
+            )
+            if df is None or len(df) == 0:
+                return None
+
+            # Normalize column names
+            col_map = {}
+            for col in df.columns:
+                if col.lower() in ("o", "open"):  col_map[col] = "open"
+                if col.lower() in ("h", "high"):  col_map[col] = "high"
+                if col.lower() in ("l", "low"):   col_map[col] = "low"
+                if col.lower() in ("c", "close"): col_map[col] = "close"
+                if col.lower() in ("t", "time"):  col_map[col] = "time"
+            df = df.rename(columns=col_map)
+
+            return df.tail(count).to_dict("records")
+
+        except Exception as e:
+            print(f"    ⚠️  Candle error [{instrument_name} {resolution_mins}m]: {e}")
+            return None
+
+# ─────────────────────────────────────────
+#  3. ANALYTICAL ENGINE
+# ─────────────────────────────────────────
+class MarketAnalyzer:
+
+    @staticmethod
+    def calculate_atr(candles, period=14):
+        if len(candles) < period + 1:
+            return 0.0
+        true_ranges = []
+        for i in range(1, len(candles)):
+            h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+            true_ranges.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(true_ranges[-period:]) / period
+
+    @classmethod
+    def calculate_structure(cls, candles, lookback=20):
+        if not candles or len(candles) < lookback + 2:
+            return None
+        try:
+            recent  = candles[-lookback:]
+            closes  = [c["close"] for c in recent]
+            highs   = [c["high"]  for c in recent]
+            lows    = [c["low"]   for c in recent]
+
+            current    = closes[-1]
+            swing_h    = max(highs)
+            swing_l    = min(lows)
+            atr        = cls.calculate_atr(candles)
+            midpoint   = (swing_h + swing_l) / 2
+            price_range = swing_h - swing_l
+
+            # Chop filter — range too small relative to volatility
+            is_choppy = price_range < (atr * 2.5)
+
+            # Dynamic bias
+            if current > midpoint + (atr * 0.2):   bias = "bullish"
+            elif current < midpoint - (atr * 0.2): bias = "bearish"
+            else:                                   bias = "neutral"
+
+            # Dynamic level proximity
+            near_h   = abs(current - swing_h) < (atr * 0.5)
+            near_l   = abs(current - swing_l) < (atr * 0.5)
+            at_level = near_h or near_l
+            level    = round(swing_h, 2) if near_h else (round(swing_l, 2) if near_l else None)
+
+            # Momentum
+            last5 = closes[-5:]
+            hh = all(last5[i] >= last5[i-1] for i in range(1, len(last5)))
+            ll = all(last5[i] <= last5[i-1] for i in range(1, len(last5)))
+
+            if is_choppy:
+                momentum, structure_clear = "glitch / chop", False
+            elif hh:
+                momentum, structure_clear = "building bullish", bias == "bullish"
+            elif ll:
+                momentum, structure_clear = "building bearish", bias == "bearish"
+            else:
+                momentum, structure_clear = "neutral", False
+
+            return {
+                "bias":           bias,
+                "swing_high":     round(swing_h, 2),
+                "swing_low":      round(swing_l, 2),
+                "current_price":  round(current, 2),
+                "at_level":       at_level,
+                "level_price":    level,
+                "momentum":       momentum,
+                "structure_clear": structure_clear,
+                "current_atr":    round(atr, 2),
+            }
+        except Exception as e:
+            print(f"    Structure error: {e}")
+            return None
+
+# ─────────────────────────────────────────
+#  4. LOGGER
+# ─────────────────────────────────────────
+class TradeLogger:
+
+    @staticmethod
+    def print_decision(d):
+        icon = "🟢" if d["signal"] == "EVALUATE" else "🔴"
+        print(f"\n  {icon} {d['instrument']} — {d['signal']}")
+        print(f"     Mode: {d['mode'].upper()} | Dir: {d['direction'] or 'none'} | Grade: {d['grade'] or 'n/a'}")
+        print(f"     Price: {d['current_price'] or 'n/a'} | Key Level: {d['key_level'] or 'none'}")
+        print(f"     Reasons:")
+        for r in d["reason"]:
+            print(f"       — {r}")
+        for tf, s in d.get("structures", {}).items():
+            if s:
+                print(f"     [{tf}] {s['bias']} | H:{s['swing_high']} L:{s['swing_low']} | {s['momentum']} | ATR:{s['current_atr']}")
+
+    @staticmethod
+    def log_to_csv(decision, filename="mamba_signals_log.csv"):
+        file_exists = os.path.isfile(filename)
+        try:
+            with open(filename, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["Time_UTC", "Asset", "Mode", "Direction", "Grade",
+                                     "Entry_Type", "Price", "Key_Level", "Reason"])
+                writer.writerow([
+                    decision["timestamp"], decision["instrument"],
+                    decision["mode"].upper(), decision["direction"],
+                    decision["grade"], decision.get("entry_type", "N/A"),
+                    decision["current_price"], decision["key_level"],
+                    " | ".join(decision["reason"])
+                ])
+        except Exception as e:
+            print(f"  ⚠️ CSV write error: {e}")
+
+# ─────────────────────────────────────────
+#  5. MASTER CONTROLLER
+# ─────────────────────────────────────────
+class TradingAgent:
+    def __init__(self):
+        self.config   = Config()
+        self.api      = TradeLockerAPI(self.config)
+        self.analyzer = MarketAnalyzer()
+        self.logger   = TradeLogger()
+
+    def get_session_mode(self):
+        est = (datetime.now(timezone.utc).hour - 5) % 24
+        for name, w in self.config.SESSIONS.items():
+            if w["start"] <= est < w["end"]:
+                return "mamba", name, est
+        return "alexg", "off_session", est
+
+    def evaluate(self, instrument, mode):
+        tf_map = {"15M": 15, "5M": 5} if mode == "mamba" else {"4H": 240, "1H": 60}
+
+        structures = {}
+        for label, res in tf_map.items():
+            candles = self.api.get_candles(instrument, res)
+            structures[label] = self.analyzer.calculate_structure(candles) if candles else None
+
+        decision = {
+            "instrument":    instrument,
+            "mode":          mode,
+            "timestamp":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "current_price": structures.get("5M" if mode == "mamba" else "1H") and
+                             structures.get("5M" if mode == "mamba" else "1H", {}).get("current_price"),
+            "structures":    structures,
+            "signal":        "WAIT",
+            "reason":        [],
+            "grade":         None,
+            "direction":     None,
+            "entry_type":    None,
+            "key_level":     None,
+        }
+
+        if mode == "mamba":
+            s15, s5 = structures.get("15M"), structures.get("5M")
+            if not s15 or not s5:
+                decision["reason"].append("Candle data unavailable")
+            elif s15["bias"] == s5["bias"] and s15["bias"] != "neutral":
+                bias = s15["bias"]
+                if s15["structure_clear"] and s5["structure_clear"]:
+                    decision.update({
+                        "signal": "EVALUATE", "direction": bias,
+                        "entry_type": "market",
+                        "grade": "A+" if s5["at_level"] else "B+",
+                        "key_level": s5["level_price"],
+                        "current_price": s5["current_price"],
+                    })
+                    decision["reason"].append(f"15M & 5M aligned {bias}.")
+                    if s5["at_level"]:
+                        decision["reason"].append(f"Price at key level ({s5['level_price']}).")
+                else:
+                    decision["reason"].append("Choppy / structure unclear.")
+            else:
+                decision["reason"].append(f"TF mismatch (15M:{s15['bias']} / 5M:{s5['bias']}).")
+
+        else:
+            s4h, s1h = structures.get("4H"), structures.get("1H")
+            if not s4h or not s1h:
+                decision["reason"].append("Candle data unavailable")
+            elif s4h["bias"] != "neutral" and s4h["bias"] == s1h["bias"]:
+                bias = s4h["bias"]
+                if s4h["structure_clear"] and s1h["structure_clear"]:
+                    if s4h["at_level"] or s1h["at_level"]:
+                        decision.update({
+                            "signal": "EVALUATE", "direction": bias,
+                            "entry_type": "limit", "grade": "A+",
+                            "key_level": s4h["level_price"] or s1h["level_price"],
+                            "current_price": s1h["current_price"],
+                        })
+                        decision["reason"].append(f"4H & 1H aligned {bias}. Price at structural level.")
+                    else:
+                        decision["reason"].append(f"Bias {bias} confirmed — not at level yet, wait.")
+                else:
+                    decision["reason"].append("Choppy / structure unclear.")
+            else:
+                decision["reason"].append(f"TF mismatch (4H:{s4h['bias'] if s4h else 'N/A'} / 1H:{s1h['bias'] if s1h else 'N/A'}).")
+
+        return decision
+
+    def run(self):
+        print("\n" + "="*55)
+        print("  MambaFX Agent v4 — Unified Engine")
+        print("  Status: 🟢 ONLINE (Fault Tolerance Active)")
+        print("="*55)
+
+        if self.config.RISK["kill_switch"]:
+            return print("🔴 KILL SWITCH ACTIVE — Agent halted.")
+
+        if not self.api.authenticate() or not self.api.load_account():
+            return print("❌ Fatal Boot Error: Could not connect to broker.")
+
+        print("✅ Connected to ClarityFX demo — Account 1941353\n")
+
+        scan_count = 0
+
+        while True:
+            try:
+                scan_count += 1
+                mode, session, est = self.get_session_mode()
+                interval = self.config.SCAN_MAMBA if mode == "mamba" else self.config.SCAN_ALEXG
+
+                print(f"\n{'─'*55}")
+                print(f"  SCAN #{scan_count} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+                print(f"  Mode: {mode.upper()} | Session: {session.upper()} | EST: {est}:00")
+                print(f"{'─'*55}")
+
+                actionable = []
+                for instrument in self.config.INSTRUMENTS:
+                    decision = self.evaluate(instrument, mode)
+                    self.logger.print_decision(decision)
+                    if decision["signal"] == "EVALUATE":
+                        actionable.append(decision)
+
+                if actionable:
+                    best = sorted(actionable, key=lambda x: x["grade"] or "Z")[0]
+                    self.logger.log_to_csv(best)
+                    print(f"\n  ⭐ Best setup logged: {best['instrument']} "
+                          f"({best['direction'].upper()} | {best['grade']})")
+                else:
+                    print(f"\n  ⏳ No qualifying setups — next scan in {interval//60} min")
+
+                if scan_count % 5 == 0:
+                    self.api.authenticate()
+
+                time.sleep(interval)
+
+            except Exception as e:
+                print(f"\n  🛑 [ERROR] {e}")
+                print("     Rebooting in 120s...")
+                time.sleep(120)
+                self.api.authenticate()
+
+
+if __name__ == "__main__":
+    agent = TradingAgent()
+    agent.run()

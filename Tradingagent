@@ -19,9 +19,9 @@ logging.getLogger("tradelocker").setLevel(logging.WARNING)
 #  1. CONFIGURATION
 # ─────────────────────────────────────────
 class Config:
-    EMAIL    = "primordialprimal@proton.me"
-    PASSWORD = "Clarity#1"
-    SERVER   = "CLRTYFX"
+    EMAIL    = "
+    PASSWORD = "
+    SERVER   = "
 
     # Confirmed instrument IDs from TradeLocker
     INSTRUMENTS = {
